@@ -49,10 +49,11 @@ let routingControl = null;
 let navigatingDestination = null; // 現在案内中の目的地のLatLng
 let hasNotifiedArrival = false;   // 到着通知をすでに表示したかどうか
 
-// ★緑のルート上を白く塗るための変数
+// ★緑のルート上を白く塗る・自動リルート用の変数
 let routeCoordinates = [];        // 案内ルートのすべての座標データ
 let maxReachedIndex = 0;          // ルート上で到達した最も先のポイント（インデックス）
 let traveledPolyline = null;      // 白色の線そのもの
+let isFetchingRoute = false;      // ★ルート再計算中に連続して通信させないためのフラグ
 
 // ====== 到着モーダル制御機能 ======
 function showArrivalModal() {
@@ -76,6 +77,8 @@ function confirmArrivalFinish() {
 
 // ====== ルート検索機能 ======
 function showRouteTo(destLat, destLng) {
+    if (isFetchingRoute) return; // すでに計算中なら処理をスキップ（通信連打を防ぐ）
+
     let startLatLng = userLocation;
     if (!startLatLng) {
         startLatLng = map.getCenter();
@@ -84,6 +87,8 @@ function showRouteTo(destLat, destLng) {
     if (routingControl !== null) {
         map.removeControl(routingControl);
     }
+
+    isFetchingRoute = true; // ★計算開始フラグをON
 
     routingControl = L.Routing.control({
         waypoints: [
@@ -101,11 +106,12 @@ function showRouteTo(destLat, destLng) {
         show: true
     }).addTo(map);
 
-    // ★ルートが計算されたら、そのルートの座標データを保存する
+    // ★ルートが取得できたら座標データを保存
     routingControl.on('routesfound', function(e) {
+        isFetchingRoute = false; // ★計算完了でフラグ解除
         let routes = e.routes;
-        routeCoordinates = routes[0].coordinates; // ルートの形を作るすべての点（座標）
-        maxReachedIndex = 0; // 到達ポイントを初期化
+        routeCoordinates = routes[0].coordinates; // ルートを作るすべての点（座標）
+        maxReachedIndex = 0; // 到達ポイントをリセット
         
         if (traveledPolyline) {
             map.removeLayer(traveledPolyline);
@@ -118,6 +124,12 @@ function showRouteTo(destLat, destLng) {
             lineCap: 'round',
             lineJoin: 'round'
         }).addTo(map);
+    });
+
+    // エラー時の安全性確保
+    routingControl.on('routingerror', function(e) {
+        isFetchingRoute = false;
+        console.log("ルート検索でエラーが発生しました:", e);
     });
 
     map.closePopup(); 
@@ -238,37 +250,55 @@ function locateUser() {
                 }
             }
 
-            // ★ルート（緑色の線）のうえを歩いた分だけ白く塗る処理
-            if (routingControl !== null && routeCoordinates.length > 0) {
-                let closestIndex = maxReachedIndex;
-                let minDistance = Infinity;
+            // ★ルート描画 ＆ 自動リルート判定処理
+            if (routingControl !== null && routeCoordinates.length > 0 && !isFetchingRoute) {
                 
-                // 現在到達しているポイントの前後で、最も現在地に近いルート上のポイントを探す
+                // 1. ルート逸脱判定（リルートが必要か）
+                let minGlobalDist = Infinity;
+                
+                // まだ通っていない（到達ポイント以降の）ルート座標全体から最寄り距離を計算
+                for (let i = maxReachedIndex; i < routeCoordinates.length; i++) {
+                    let pt = routeCoordinates[i];
+                    let dist = userLocation.distanceTo(L.latLng(pt.lat, pt.lng));
+                    if (dist < minGlobalDist) {
+                        minGlobalDist = dist;
+                    }
+                }
+                
+                // ルートから【70m以上】離れたらルートから外れたと判定し、自動でリルート実行
+                if (minGlobalDist > 70) {
+                    console.log("ルートを外れました。新しい現在地からルートを再検索します。");
+                    showRouteTo(navigatingDestination.lat, navigatingDestination.lng);
+                    return; // 再検索が開始されたら白線の描画処理は一時保留
+                }
+
+                // 2. ルート上の走行（白線を描く処理）
+                let closestIndex = maxReachedIndex;
+                let minDistanceLocal = Infinity;
+                
                 let searchStart = Math.max(0, maxReachedIndex - 10);
                 let searchEnd = Math.min(routeCoordinates.length, maxReachedIndex + 80);
                 
                 for (let i = searchStart; i < searchEnd; i++) {
                     let pt = routeCoordinates[i];
                     let dist = userLocation.distanceTo(L.latLng(pt.lat, pt.lng));
-                    if (dist < minDistance) {
-                        minDistance = dist;
+                    if (dist < minDistanceLocal) {
+                        minDistanceLocal = dist;
                         closestIndex = i;
                     }
                 }
 
-                // ルート上の最も近い点が50メートル以内なら「ルート上を歩いている」とみなす
-                if (minDistance <= 50) {
-                    // より先に進んでいれば到達ポイントを更新
+                // 最寄りポイントが50m以内であれば正常にルート進行中とみなす
+                if (minDistanceLocal <= 50) {
                     if (closestIndex > maxReachedIndex) {
                         maxReachedIndex = closestIndex;
                     }
                     
-                    // スタート地点から現在到達したポイントまでの「緑のルートの座標」を切り出して白線にする
                     let traveledPathCoords = routeCoordinates.slice(0, maxReachedIndex + 1).map(pt => L.latLng(pt.lat, pt.lng));
                     
                     if (traveledPolyline) {
                         traveledPolyline.setLatLngs(traveledPathCoords);
-                        traveledPolyline.bringToFront(); // 緑の線より上に表示
+                        traveledPolyline.bringToFront();
                     }
                 }
             }
